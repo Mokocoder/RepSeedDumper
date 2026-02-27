@@ -1,5 +1,6 @@
 #include "RepLayoutGenerator.h"
 #include "StructFlagsOffset.h"
+#include "Platform.h"
 
 #include "Json/json.hpp"
 
@@ -132,6 +133,129 @@ int32 RepLayoutGenerator::GetEnumMax(UEEnum Enum)
 	}
 
 	return static_cast<int32>(MaxVal);
+}
+
+static nlohmann::json GetEnumValues(UEEnum Enum)
+{
+	nlohmann::json Values = nlohmann::json::object();
+	if (!Enum)
+		return Values;
+
+	for (auto& [Name, Value] : Enum.GetNameValuePairs())
+	{
+		std::string Short = Name.ToString();
+		auto Pos = Short.rfind("::");
+		if (Pos != std::string::npos)
+			Short = Short.substr(Pos + 2);
+
+		if (Short == "MAX" || Short.ends_with("_MAX"))
+			continue;
+
+		Values[Short] = Value;
+	}
+	return Values;
+}
+
+static nlohmann::json ExpandStructFields(UEStruct Inner, int Depth = 0);
+
+static void AnnotateProperty(nlohmann::json& Entry, UEProperty Prop, int Depth = 0)
+{
+	EClassCastFlags Cast = Prop.GetCastFlags();
+
+	if (Cast & EClassCastFlags::StructProperty)
+	{
+		UEStructProperty SP = Prop.Cast<UEStructProperty>();
+		UEStruct St = SP.GetUnderlayingStruct();
+		if (St)
+		{
+			Entry["struct_type"] = St.GetName();
+			if (Depth < 4)
+			{
+				nlohmann::json Fields = ExpandStructFields(St, Depth + 1);
+				if (!Fields.empty())
+					Entry["fields"] = std::move(Fields);
+			}
+		}
+	}
+	else if (Cast & EClassCastFlags::ArrayProperty)
+	{
+		UEArrayProperty AP = Prop.Cast<UEArrayProperty>();
+		UEProperty InnerP = AP.GetInnerProperty();
+		if (InnerP)
+		{
+			Entry["inner_type"] = RepLayoutGenerator::GetRepTypeString(InnerP);
+			nlohmann::json InnerDetail = nlohmann::json::object();
+			AnnotateProperty(InnerDetail, InnerP, Depth);
+			if (InnerDetail.size() > 0)
+				Entry.update(InnerDetail);
+		}
+	}
+	else if (Cast & EClassCastFlags::ByteProperty)
+	{
+		UEByteProperty BP = Prop.Cast<UEByteProperty>();
+		UEEnum E = BP.GetEnum();
+		if (E)
+		{
+			Entry["enum"] = E.GetName();
+			int32 Max = RepLayoutGenerator::GetEnumMax(E);
+			if (Max > 0) Entry["max"] = Max;
+			Entry["values"] = GetEnumValues(E);
+		}
+	}
+	else if (Cast & EClassCastFlags::EnumProperty)
+	{
+		UEEnumProperty EP = Prop.Cast<UEEnumProperty>();
+		UEEnum E = EP.GetEnum();
+		if (E)
+		{
+			Entry["enum"] = E.GetName();
+			int32 Max = RepLayoutGenerator::GetEnumMax(E);
+			if (Max > 0) Entry["max"] = Max;
+			Entry["values"] = GetEnumValues(E);
+		}
+	}
+	else if (Cast & EClassCastFlags::ClassProperty)
+	{
+		UEClassProperty CP = Prop.Cast<UEClassProperty>();
+		UEClass Meta = CP.GetMetaClass();
+		if (Meta)
+			Entry["meta_class"] = Meta.GetName();
+	}
+	else if (Cast & EClassCastFlags::ObjectProperty || Cast & EClassCastFlags::ObjectPropertyBase)
+	{
+		UEObjectProperty OP = Prop.Cast<UEObjectProperty>();
+		UEClass PC = OP.GetPropertyClass();
+		if (PC)
+			Entry["object_class"] = PC.GetName();
+	}
+}
+
+static nlohmann::json ExpandStructFields(UEStruct Inner, int Depth)
+{
+	nlohmann::json FieldsArr = nlohmann::json::array();
+
+	std::vector<UEStruct> Chain;
+	{
+		UEStruct Cur = Inner;
+		while (Cur) { Chain.push_back(Cur); Cur = Cur.GetSuper(); }
+		std::reverse(Chain.begin(), Chain.end());
+	}
+
+	for (UEStruct& Anc : Chain)
+	{
+		for (UEProperty Field : Anc.GetProperties())
+		{
+			nlohmann::json E;
+			E["name"] = Field.GetName();
+			E["type"] = RepLayoutGenerator::GetRepTypeString(Field);
+			E["offset"] = Field.GetOffset();
+			E["size"] = Field.GetSize();
+			AnnotateProperty(E, Field, Depth);
+			FieldsArr.push_back(std::move(E));
+		}
+	}
+
+	return FieldsArr;
 }
 
 
@@ -335,7 +459,6 @@ void RepLayoutGenerator::Generate()
 
 	int32 TotalClasses = 0;
 	int32 StructTypesResolved = 0;
-
 	for (UEObject Obj : ObjectArray())
 	{
 		if (!Obj.IsA(EClassCastFlags::Class))
@@ -428,8 +551,36 @@ void RepLayoutGenerator::Generate()
 
 			for (UEFunction Func : AncestorClass.GetFunctions())
 			{
-				if (Func.HasFlags(EFunctionFlags::Net))
-					NetFieldsArray.push_back({ {"name", Func.GetName()}, {"type", "function"}, {"class", AncName} });
+				if (!Func.HasFlags(EFunctionFlags::Net))
+					continue;
+
+				nlohmann::json FuncEntry = { {"name", Func.GetName()}, {"type", "function"}, {"class", AncName} };
+
+				nlohmann::json ParamsArray = nlohmann::json::array();
+				for (UEProperty Param : Func.GetProperties())
+				{
+					EPropertyFlags ParamFlags = Param.GetPropertyFlags();
+					if (!(ParamFlags & EPropertyFlags::Parm))
+						continue;
+					if (ParamFlags & EPropertyFlags::ReturnParm)
+						continue;
+
+					nlohmann::json ParamEntry;
+					ParamEntry["name"] = Param.GetName();
+					ParamEntry["type"] = GetRepTypeString(Param);
+					AnnotateProperty(ParamEntry, Param);
+
+					ParamsArray.push_back(std::move(ParamEntry));
+				}
+
+				if (!ParamsArray.empty())
+					FuncEntry["params"] = std::move(ParamsArray);
+
+				void* ExecFunc = Func.GetExecFunction();
+				if (ExecFunc)
+					FuncEntry["offset"] = std::format("0x{:X}", Platform::GetOffset(ExecFunc));
+
+				NetFieldsArray.push_back(std::move(FuncEntry));
 			}
 		}
 
