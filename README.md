@@ -11,6 +11,8 @@ Produces `replication_seed.json` containing per-class replication data:
 
 Only native C++ classes are included.
 
+Blueprint classes can be resolved using [RepSeedResolver](https://github.com/Mokocoder/RepSeedResolver) with the seed output from this tool.
+
 ## Build
 
 ```
