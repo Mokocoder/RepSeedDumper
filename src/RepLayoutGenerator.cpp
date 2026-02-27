@@ -549,11 +549,20 @@ void RepLayoutGenerator::Generate()
 				}
 			}
 
+			/* Collect net functions and sort by name (UE ClassNetCache ordering) */
+			std::vector<UEFunction> NetFuncs;
 			for (UEFunction Func : AncestorClass.GetFunctions())
 			{
-				if (!Func.HasFlags(EFunctionFlags::Net))
-					continue;
+				if (Func.HasFlags(EFunctionFlags::Net))
+					NetFuncs.push_back(Func);
+			}
+			std::sort(NetFuncs.begin(), NetFuncs.end(), [](const UEFunction& A, const UEFunction& B)
+			{
+				return A.GetName() < B.GetName();
+			});
 
+			for (UEFunction& Func : NetFuncs)
+			{
 				nlohmann::json FuncEntry = { {"name", Func.GetName()}, {"type", "function"}, {"class", AncName} };
 
 				nlohmann::json ParamsArray = nlohmann::json::array();
